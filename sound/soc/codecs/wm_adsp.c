@@ -2012,7 +2012,6 @@ out_async:
 	}
 
 out_fw:
-	regmap_async_complete(regmap);
 	release_firmware(firmware);
 	wm_adsp_buf_free(&buf_list);
 out:
@@ -2972,6 +2971,212 @@ err_capt_buf:
 
 	return ret;
 }
-EXPORT_SYMBOL_GPL(wm_adsp2_init);
+EXPORT_SYMBOL_GPL(wm_adsp_stream_alloc);
+
+int wm_adsp_stream_free(struct wm_adsp *dsp)
+{
+	kfree(dsp->host_regions);
+	dsp->host_regions = NULL;
+
+	kfree(dsp->raw_capt_buf);
+	dsp->raw_capt_buf = NULL;
+
+	if (dsp->capt_buf.buf) {
+		vfree(dsp->capt_buf.buf);
+		dsp->capt_buf.buf = NULL;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(wm_adsp_stream_free);
+
+int wm_adsp_stream_start(struct wm_adsp *dsp)
+{
+	u32 xm_base, magic;
+	int i, ret;
+
+	ret = wm_adsp_read_data_word(dsp, WMFW_ADSP2_XM,
+				     ADSP2_SYSTEM_CONFIG_XM_PTR, &xm_base);
+	if (ret < 0)
+		return ret;
+
+	ret = wm_adsp_read_data_word(dsp, WMFW_ADSP2_XM,
+				     xm_base + WM_ADSP_ALG_XM_PTR +
+				     ALG_XM_FIELD(magic),
+				     &magic);
+	if (ret < 0)
+		return ret;
+
+	if (magic != WM_ADSP_ALG_XM_STRUCT_MAGIC)
+		return -EINVAL;
+
+	for (i = 0; i < 5; ++i) {
+		ret = wm_adsp_read_data_word(dsp, WMFW_ADSP2_XM,
+					     xm_base + WM_ADSP_ALG_XM_PTR +
+					     ALG_XM_FIELD(host_buf_ptr),
+					     &dsp->host_buf_ptr);
+		if (ret < 0)
+			return ret;
+
+		if (dsp->host_buf_ptr)
+			break;
+
+		msleep(1);
+	}
+
+	if (!dsp->host_buf_ptr)
+		return -EIO;
+
+	dsp->max_dsp_read_bytes = WM_ADSP_MAX_READ_SIZE * sizeof(u32);
+	ret = wm_adsp_populate_buffer_regions(dsp);
+	if (ret < 0)
+		return ret;
+
+	ret = wm_adsp_host_buffer_write(dsp,
+					HOST_BUFFER_FIELD(high_water_mark),
+					dsp->capt_watermark);
+	if (ret < 0)
+		return ret;
+
+	adsp_dbg(dsp, "Set watermark to %u\n", dsp->capt_watermark);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(wm_adsp_stream_start);
+
+static int wm_adsp_stream_capture(struct wm_adsp *dsp)
+{
+	int avail = 0;
+	int amount_read;
+	int total_read = 0;
+	int ret = 0;
+
+	dsp->buffer_drain_pending = false;
+
+	do {
+		amount_read = 0;
+		do {
+			ret = wm_adsp_capture_block(dsp, &avail);
+			if (ret < 0)
+				return ret;
+
+			amount_read += ret;
+		} while (ret > 0);
+
+		total_read += amount_read;
+	} while (amount_read > 0 && avail > WM_ADSP_MAX_READ_SIZE);
+
+	if (avail > WM_ADSP_MAX_READ_SIZE)
+		dsp->buffer_drain_pending = true;
+
+	return total_read * WM_ADSP_DATA_WORD_SIZE;
+}
+
+static int wm_adsp_ack_buffer_interrupt(struct wm_adsp *dsp)
+{
+	u32 irq_ack;
+	int ret;
+
+	ret = wm_adsp_host_buffer_read(dsp,
+				       HOST_BUFFER_FIELD(irq_count),
+				       &irq_ack);
+	if (ret < 0)
+		return ret;
+
+	if (!dsp->buffer_drain_pending)
+		irq_ack |= 1;		/* enable further IRQs */
+
+	ret = wm_adsp_host_buffer_write(dsp,
+					HOST_BUFFER_FIELD(irq_ack),
+					irq_ack);
+	return ret;
+}
+
+int wm_adsp_stream_handle_irq(struct wm_adsp *dsp)
+{
+	int ret, bytes_captured;
+
+	ret = wm_adsp_host_buffer_read(dsp,
+				       HOST_BUFFER_FIELD(error),
+				       &dsp->dsp_error);
+	if (ret < 0)
+		return ret;
+	if (dsp->dsp_error != 0) {
+		adsp_err(dsp, "DSP error occurred: %d\n", dsp->dsp_error);
+		return -EIO;
+	}
+
+	bytes_captured = wm_adsp_stream_capture(dsp);
+	if (bytes_captured < 0)
+		return bytes_captured;
+
+	ret = wm_adsp_ack_buffer_interrupt(dsp);
+	if (ret < 0)
+		return ret;
+
+	return bytes_captured;
+}
+EXPORT_SYMBOL_GPL(wm_adsp_stream_handle_irq);
+
+int wm_adsp_stream_read(struct wm_adsp *dsp, char __user *buf, size_t count)
+{
+	int avail, to_end;
+	int ret;
+
+	if (!dsp->running)
+		return -EIO;
+
+	avail = CIRC_CNT(dsp->capt_buf.head,
+			 dsp->capt_buf.tail,
+			 dsp->capt_buf_size);
+	to_end = CIRC_CNT_TO_END(dsp->capt_buf.head,
+				 dsp->capt_buf.tail,
+				 dsp->capt_buf_size);
+
+	if (avail < count)
+		count = avail;
+
+	adsp_dbg(dsp, "%s: avail=%d toend=%d count=%zo\n",
+		 __func__, avail, to_end, count);
+
+	if (count > to_end) {
+		if (copy_to_user(buf,
+				 dsp->capt_buf.buf +
+				 dsp->capt_buf.tail,
+				 to_end))
+			return -EFAULT;
+		if (copy_to_user(buf + to_end, dsp->capt_buf.buf,
+				 count - to_end))
+			return -EFAULT;
+	} else {
+		if (copy_to_user(buf,
+				 dsp->capt_buf.buf +
+				 dsp->capt_buf.tail,
+				 count))
+			return -EFAULT;
+	}
+
+	dsp->capt_buf.tail += count;
+	dsp->capt_buf.tail &= dsp->capt_buf_size - 1;
+
+	if (dsp->buffer_drain_pending) {
+		wm_adsp_stream_capture(dsp);
+
+		ret = wm_adsp_ack_buffer_interrupt(dsp);
+		if (ret < 0)
+			return ret;
+	}
+
+	return count;
+}
+EXPORT_SYMBOL_GPL(wm_adsp_stream_read);
+
+int wm_adsp_stream_avail(const struct wm_adsp *dsp)
+{
+	return CIRC_CNT(dsp->capt_buf.head,
+			dsp->capt_buf.tail,
+			dsp->capt_buf_size);
+}
+EXPORT_SYMBOL_GPL(wm_adsp_stream_avail);
 
 MODULE_LICENSE("GPL v2");
